@@ -1,0 +1,119 @@
+---
+title: "mouse_cellranger"
+output: html_document
+date: "2023-07-25"
+---
+
+```{r setup, include=FALSE}
+library(SingleCellExperiment)
+library(DropletUtils)
+library(ggplot2)
+library(scuttle)
+library(scater)
+library(scran)
+library(bluster) 
+library(Seurat)
+```
+
+# load the dataset
+```{r}
+load_seurat <- function(path,name) {
+  data <- Read10X(data.dir = path)
+  seurat <- CreateSeuratObject(counts = data, project = name, min.cells = 3, min.features = 200)
+  return(seurat)
+}
+```
+
+```{r}
+sample1 <- load_seurat("~/Desktop/count_matrix_mouse/cellranger/SRR16409869_78/filtered_feature_bc_matrix",'sample1')
+sample2 <- load_seurat("~/Desktop/count_matrix_mouse/cellranger/SRR16409870_80/filtered_feature_bc_matrix",'sample2')
+sample3 <- load_seurat("~/Desktop/count_matrix_mouse/cellranger/SRR16409871_81/filtered_feature_bc_matrix",'sample3')
+```
+
+## Merge the data
+```{r}
+mouse.merge <- merge(sample1, y = c(sample2, sample3), add.cell.ids = c("1", "2", "3"), project = "mouse")
+```
+
+```{r}
+# add the sample column
+# modfiy the sample names
+mouse.merge$sample <- mouse.merge$orig.ident
+mouse.merge$sample <- as.factor(mouse.merge$sample)
+# Assign new labels to the levels
+new_levels <- c("mouse","mouse","mouse")
+# Update the levels of orig.ident
+levels(mouse.merge$sample) <- new_levels
+```
+
+## Quality check
+```{r}
+# add percentage of mitochrodial gene to metadata
+mouse.merge[["percent.mt"]] <- PercentageFeatureSet(mouse.merge,pattern = '^mt-')
+# visualization 
+vln_mouse <- VlnPlot(mouse.merge,features = c('nCount_RNA','nFeature_RNA','percent.mt'),group.by = 'sample') 
+```
+Bases on the original paper and the violin plot, remove the cell with number of gene less than 1500
+```{r}
+# Remove the gene < 1500
+# Remove mito > 20
+mouse.merge[['QC']] <- ifelse(mouse.merge@meta.data$percent.mt > 20 | mouse.merge@meta.data$nFeature_RNA<1500,'Fail','Pass')
+mouse.merge <- subset(mouse.merge,subset=QC=='Pass')
+```
+
+## Dimension reduction
+```{r}
+# Normalization and find variable genes 
+mouse.merge <- NormalizeData(mouse.merge)
+mouse.merge <- FindVariableFeatures(mouse.merge,selection.method = 'vst', nfeatures = 2000)
+# Scale and do PCA
+mouse.merge <- ScaleData(mouse.merge, verbose = FALSE)
+mouse.merge <- RunPCA(mouse.merge,npcs = 30, verbose = FALSE)
+```
+
+```{r}
+# Find optimal pcs
+eb_mouse <- ElbowPlot(mouse.merge,ndims = 30)
+eb_mouse
+```
+
+## Clustering
+Try different number of pc(see plots) according to elbow plots. here use 27 pcs to do following analysis 
+```{r}
+# Find clusters
+mouse.merge <- RunUMAP(mouse.merge,reduction = 'pca', dims = 1:27)
+mouse.merge <- FindNeighbors(mouse.merge,reduction = 'pca',dims = 1:27)
+mouse.merge <- FindClusters(mouse.merge,resolution = 0.8)
+```
+
+```{r}
+#Visualization
+cl_mouse <- DimPlot(mouse.merge,reduction = 'umap', label = TRUE, repel = TRUE,group.by = 'seurat_clusters')
+```
+
+
+## Cell type annotation
+according to feature plots
+```{r}
+mouse.merge$celltype <- mouse.merge$seurat_clusters
+mouse.merge$celltype <- as.factor(mouse.merge$celltype)
+new_ct <- c('EX','EX','EX','EX','EX','EX','IN','EX','EX','EX','IN','EX','EX','IN','IN','EX','IN','EX','EX','EX','EX','IN','IN','EX','IN','IN','IN','IN','IN')
+levels(mouse.merge$celltype) <- new_ct
+```
+
+
+```{r}
+ct_mouse <- DimPlot(mouse.merge,reduction = 'umap', label = TRUE, repel = TRUE,group.by = 'celltype')+theme_classic(base_size = 20)
+```
+
+## Sub-clustering 
+```{r}
+Sub_set <- function(dataset, celltypename) {
+  ct <- as_tibble(dataset@meta.data) %>% dplyr::select(seurat_clusters,celltype) %>% unique() %>% arrange(seurat_clusters) %>% filter(celltype %in% c(celltypename))
+  return(ct)
+}
+m.sub.ex <- Sub_set(mouse.merge,'EX') 
+ex.mouse <- subset(mouse.merge, idents = m.sub.ex$seurat_clusters)
+m.sub.in <- Sub_set(mouse.merge,'IN') 
+in.mouse <- subset(mouse.merge, idents = m.sub.in$seurat_clusters)
+```

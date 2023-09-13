@@ -1,0 +1,244 @@
+---
+title: "mouse_pig"
+output: html_document
+date: "2023-06-26"
+---
+
+```{r setup, include=FALSE}
+library(biomaRt)
+library(SingleCellExperiment)
+library(DropletUtils)
+library(ggplot2)
+library(scuttle)
+library(Seurat)
+library(dplyr)
+```
+
+
+```{r}
+mouse <- useMart('ensembl',dataset = "mmusculus_gene_ensembl",verbose = TRUE,host = "dec2021.archive.ensembl.org")
+pig <- useMart('ensembl',dataset = "sscrofa_gene_ensembl",verbose = TRUE,host = "dec2021.archive.ensembl.org")
+```
+
+# find homology genes between pig and human 
+```{r}
+# get pig gene
+pig.gene <- rownames(ex.pig)
+
+p2m.g <- getLDS(attributes = c("external_gene_name"),filters = "external_gene_name",
+                values = pig.gene,mart = pig,
+                attributesL = c('external_gene_name','sscrofa_homolog_orthology_confidence','sscrofa_homolog_goc_score','sscrofa_homolog_perc_id'),
+                martL = mouse,uniqueRows = T)
+# change colomn name
+colnames(p2m.g)[1] <- 'pig.gene'
+colnames(p2m.g)[2] <- 'mouse.gene'
+```
+
+```{r}
+mouse.gene <- rownames(ex.mouse)
+mouse.gene.proj <- p2m.g$mouse.gene
+common.m.gene <- intersect(mouse.gene,mouse.gene.proj) 
+```
+
+```{r}
+# Get the common genes
+common_genes <- p2m.g$mouse.gene[p2m.g$mouse.gene %in% common.m.gene]
+
+# Filter the first list based on the common genes
+p2m.g <- p2m.g[p2m.g$mouse.gene %in% common_genes,]
+# only keep one-to-one corespondence
+o2o.p2m.g <- p2m.g[!duplicated(p2m.g$pig.gene),]
+o2o.p2m.g <- o2o.p2m.g[!duplicated(o2o.p2m.g$mouse.gene),]
+```
+9,426 
+9,288 one-to-one
+138
+
+```{r}
+# get one-to-many
+o2m.p2m.g <- p2m.g[duplicated(p2m.g$pig.gene),]
+```
+
+# IN
+```{r}
+# Get the subset of cells based on the gene list
+In.mouse.common <- GetAssayData(in.mouse)[o2o.p2m.g$mouse.gene,]
+# get the common gene for pig
+In.pig.common <- GetAssayData(in.pig)[o2o.p2m.g$pig.gene,]
+```
+
+```{r}
+# change the gene's name as same as human
+rownames(In.pig.common) <- rownames(In.mouse.common)
+# convert dgCMatrix to seurat object
+In.mouse.common <- CreateSeuratObject(counts = In.mouse.common)
+In.pig.common <- CreateSeuratObject(counts = In.pig.common)
+```
+
+#change the name before integrate
+```{r}
+In.mouse.common$sample <- In.mouse.common$orig.ident
+In.mouse.common$sample <- as.factor(In.mouse.common$sample)
+new_levels <- c("mouse", "mouse", 'mouse')
+levels(In.mouse.common$sample) <- new_levels
+
+In.pig.common$sample <- In.pig.common$orig.ident
+In.pig.common$sample <- as.factor(In.pig.common$sample)
+new_level_p <- rep('pig',times=52)
+levels(In.pig.common$sample) <- new_level_p
+```
+
+#integrate
+```{r}
+# Put object in a list
+In_mp_list <- list()
+In_mp_list[['mouse']] <- In.mouse.common
+In_mp_list[['pig']] <- In.pig.common
+
+# Normalize and find variable genes in each samples
+In_mp_list <- lapply(X=In_mp_list, FUN=function(x){
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x,selection.method='vst')
+})
+```
+
+```{r}
+all.features <- rownames(In.mouse.common)
+
+# find anchor and integrate
+mp.anchors <- FindIntegrationAnchors(object.list = In_mp_list,anchor.features = all.features)
+# create integrated data assay
+In.mp.integrated <- IntegrateData(anchorset = mp.anchors,features.to.integrate = all.features)
+```
+```{r}
+rm(mp.anchors)
+rm(In_mp_list)
+```
+
+```{r}
+# Create 'integreated' assay
+DefaultAssay(In.mp.integrated) <- 'integrated'
+
+# do scaling and dimensionality reduction 
+# using 30 dimensions
+In.mp.integrated <- ScaleData(In.mp.integrated,verbose = FALSE)
+In.mp.integrated <- RunPCA(In.mp.integrated,npcs=30,verbose=FALSE)
+```
+
+```{r}
+ElbowPlot(In.mp.integrated)
+```
+
+```{r}
+In.mp.integrated <- In.mp.integrated %>%
+  RunUMAP(reduction='pca',dims = 1:15)%>%
+  FindNeighbors(reduction = 'pca',dims = 1:15)%>%
+  FindClusters(resolution = 0.8)
+```
+
+# visulization
+```{r}
+in.mp.batch<-DimPlot(In.mp.integrated,reduction = 'umap',group.by = 'sample')+theme_classic(base_size = 20)
+in.mp.batch
+in.mp.cl<-DimPlot(In.mp.integrated,reduction = 'umap',label = TRUE,group.by = 'seurat_clusters')
+in.mp.cl
+```
+
+
+
+
+# EX
+```{r}
+# Get the subset of cells based on the gene list
+ex.mouse.common <- GetAssayData(ex.mouse)[o2o.p2m.g$mouse.gene,]
+# get the common gene for pig
+ex.pig.common <- GetAssayData(ex.pig)[o2o.p2m.g$pig.gene,]
+
+# change the gene's name as same as human
+rownames(ex.pig.common) <- rownames(ex.mouse.common)
+# convert dgCMatrix to seurat object
+ex.mouse.common <- CreateSeuratObject(counts = ex.mouse.common)
+ex.pig.common <- CreateSeuratObject(counts = ex.pig.common)
+```
+
+#change the name before integrate
+```{r}
+ex.mouse.common$sample <- ex.mouse.common$orig.ident
+ex.mouse.common$sample <- as.factor(ex.mouse.common$sample)
+new_levels <- c("mouse", "mouse", 'mouse')
+levels(ex.mouse.common$sample) <- new_levels
+# pig
+ex.pig.common$sample <- ex.pig.common$orig.ident
+ex.pig.common$sample <- as.factor(ex.pig.common$sample)
+new_level_p <- rep('pig', times = 26)
+levels(ex.pig.common$sample) <- new_level_p
+```
+
+#integrate
+```{r}
+# Put object in a list
+ex_mp_list <- list()
+ex_mp_list[['mouse']] <- ex.mouse.common
+ex_mp_list[['pig']] <- ex.pig.common
+
+# Normalize and find variable genes in each samples
+ex_mp_list <- lapply(X=ex_mp_list, FUN=function(x){
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x,selection.method='vst')
+})
+```
+
+```{r}
+all.features <- rownames(ex.mouse.common)
+
+# find anchor and integrate
+mp.anchors <- FindIntegrationAnchors(object.list = ex_mp_list,anchor.features = all.features)
+# create integrated data assay
+ex.mp.integrated <- IntegrateData(anchorset = mp.anchors,features.to.integrate = all.features)
+rm(ex_mp_list)
+rm(mp.anchors)
+```
+
+```{r}
+# Create 'integreated' assay
+DefaultAssay(ex.mp.integrated) <- 'integrated'
+
+# do scaling and dimensionality reduction 
+# using 30 dimensions
+ex.mp.integrated <- ScaleData(ex.mp.integrated,verbose = FALSE)
+ex.mp.integrated <- RunPCA(ex.mp.integrated,npcs=30,verbose=FALSE)
+```
+
+```{r}
+ElbowPlot(ex.mp.integrated,ndims = 30)
+```
+
+```{r}
+ex.mp.integrated <- ex.mp.integrated %>%
+  RunUMAP(reduction='pca',dims = 1:20)%>%
+  FindNeighbors(reduction = 'pca',dims = 1:20)%>%
+  FindClusters(resolution = 0.8)
+```
+
+# visualization
+```{r}
+ex.mp.batch <- DimPlot(ex.mp.integrated,reduction = 'umap',group.by = 'sample')+theme_classic(base_size = 20)
+```
+
+
+# cell type ex
+```{r}
+# DB file
+db_EX = '~/Desktop/EX_genes.xlsx';
+tissue = "Brain" 
+```
+
+
+```{r}
+ex.mp.integrated <- CellTypeAnnotionInt(ex.mp.integrated, db_EX, tissue)
+```
+
+```{r}
+ex.mp.ct <- DimPlot(ex.mp.integrated,reduction = 'umap',repel = TRUE,label = TRUE,group.by = 'customclassif')+theme_classic(base_size = 20)
+```
+

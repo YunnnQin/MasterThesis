@@ -1,0 +1,238 @@
+---
+title: "orthology_pighuman"
+output: html_document
+date: "2023-06-02"
+---
+
+This script is to find the orthology genes between pig and human
+
+```{r setup, include=FALSE}
+library(biomaRt)
+library(SingleCellExperiment)
+library(DropletUtils)
+library(ggplot2)
+library(scuttle)
+library(Seurat)
+```
+
+
+## Find gene orthologues
+
+```{r}
+# create mart object
+human <- useMart(biomart="ensembl", dataset = "hsapiens_gene_ensembl", verbose = TRUE, host = "dec2021.archive.ensembl.org")
+pig <- useMart('ensembl',dataset = "sscrofa_gene_ensembl",verbose = TRUE,host = "dec2021.archive.ensembl.org")
+```
+
+# find homology genes between pig and human 
+```{r}
+# get pig gene
+pig.gene <- rownames(ex.pig)
+
+p2h.g <- getLDS(attributes = c("external_gene_name"),filters = "external_gene_name",
+                values = pig.gene,mart = pig,
+                attributesL = c('external_gene_name','sscrofa_homolog_orthology_confidence','sscrofa_homolog_goc_score','sscrofa_homolog_perc_id'),
+                martL = human,uniqueRows = T)
+# change colomn name
+colnames(p2h.g)[1] <- 'pig.gene'
+colnames(p2h.g)[2] <- 'human.gene'
+```
+14842
+
+
+```{r}
+human.gene <- rownames(ex.human)
+human.gene.proj <- p2h.g$human.gene
+common.h.gene <- intersect(human.gene,human.gene.proj) #14783
+```
+
+```{r}
+# Get the common genes
+common_genes <- p2h.g$human.gene[p2h.g$human.gene %in% common.h.gene]
+
+# Filter the first list based on the common genes
+p2h.g <- p2h.g[p2h.g$human.gene %in% common_genes,]
+# only keep one-to-one corespondence
+o2o.p2h.g <- p2h.g[!duplicated(p2h.g$pig.gene),]
+o2o.p2h.g <- o2o.p2h.g[!duplicated(o2o.p2h.g$human.gene),]
+```
+9444 orthology genes in total 
+9440 one-to-one
+
+```{r}
+# get one-to-many
+o2m.p2h.g <- p2h.g[duplicated(p2h.g$pig.gene),]
+```
+
+
+## get the subset of human.integrate
+use only one-to-one orthology genes
+```{r}
+# Get the subset of cells based on the gene list
+ex.human.common <- GetAssayData(ex.human)[o2o.p2h.g$human.gene,]
+in.human.common <- GetAssayData(in.human)[o2o.p2h.g$human.gene,]
+# 9440 genes left
+```
+
+# get the subset of mouse.merge
+```{r}
+# get the common gene
+ex.pig.common <- GetAssayData(ex.pig)[o2o.p2h.g$pig.gene,]
+in.pig.common <- GetAssayData(in.pig)[o2o.p2h.g$pig.gene,]
+```
+
+```{r}
+# change the gene's name as same as human
+rownames(ex.pig.common) <- rownames(ex.human.common)
+rownames(in.pig.common) <- rownames(in.human.common)
+```
+
+```{r}
+# convert dgCMatrix to seurat object
+ex.human.common <- CreateSeuratObject(counts = ex.human.common,project = 'human')
+ex.pig.common <- CreateSeuratObject(counts = ex.pig.common,project = 'pig')
+in.human.common <- CreateSeuratObject(counts = in.human.common,project = 'human')
+in.pig.common <- CreateSeuratObject(counts = in.pig.common,project = 'pig')
+```
+
+#add sample 
+```{r}
+#change sample name
+# pig
+ex.pig.common$sample <- ex.pig.common$orig.ident
+ex.pig.common$sample <- as.factor(ex.pig.common$sample)
+new_level_p <- rep('pig', times = 26)
+levels(ex.pig.common$sample) <- new_level_p
+# human
+ex.human.common$sample <- ex.human.common$orig.ident
+ex.human.common$sample <- as.factor(ex.human.common$sample)
+new_level_h <- c('human')
+levels(ex.human.common$sample) <- new_level_h
+
+# pig
+in.pig.common$sample <- in.pig.common$orig.ident
+in.pig.common$sample <- as.factor(in.pig.common$sample)
+new_level_p <- rep('pig',times =52)
+levels(in.pig.common$sample) <- new_level_p
+# human
+in.human.common$sample <- in.human.common$orig.ident
+in.human.common$sample <- as.factor(in.human.common$sample)
+new_level_h <- c('human')
+levels(in.human.common$sample) <- new_level_h
+```
+
+## integrate human and pig together
+# IN sub
+```{r}
+# Put object in a list
+in_hp_list <- list()
+in_hp_list[['human']] <- in.human.common
+in_hp_list[['pig']] <- in.pig.common
+
+# Normalize and find variable genes in each samples
+in_hp_list <- lapply(X=in_hp_list, FUN=function(x){
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x,selection.method='vst')
+})
+```
+
+```{r}
+all.features <- rownames(in.human.common)
+
+# find anchor and integrate
+in.hp.anchors <- FindIntegrationAnchors(object.list = in_hp_list,anchor.features = all.features)
+# create integrated data assay
+in.hp.integrated <- IntegrateData(anchorset = in.hp.anchors,features.to.integrate = all.features)
+```
+```{r}
+rm(in.hp.anchors)
+rm(in_hp_list)
+```
+
+```{r}
+# do scaling and dimensionality reduction 
+# using 30 dimensions
+in.hp.integrated <- ScaleData(in.hp.integrated,verbose = FALSE)
+in.hp.integrated <- RunPCA(in.hp.integrated,npcs=30,verbose=FALSE)
+```
+
+```{r}
+ElbowPlot(in.hp.integrated,ndims = 30)
+```
+
+```{r}
+in.hp.integrated <- in.hp.integrated %>% RunUMAP(reduction='pca',dims = 1:20) %>% FindNeighbors(reduction = 'pca',dims = 1:20) %>%
+  FindClusters(resolution = 0.8)
+```
+
+```{r}
+in_hp_batch <- DimPlot(in.hp.integrated,reduction = 'umap',repel = TRUE,group.by = "sample") +theme_classic(base_size = 18)
+in_hp_batch
+in.hp.cl <- DimPlot(in.hp.integrated,reduction = 'umap',label = TRUE,repel = TRUE,group.by = "seurat_clusters")+theme_classic(base_size = 20)
+in.hp.cl
+```
+
+# EX
+# integrate
+
+```{r}
+# Put object in a list
+ex_hp_list <- list()
+ex_hp_list[['human']] <- ex.human.common
+ex_hp_list[['pig']] <- ex.pig.common
+
+# Normalize and find variable genes in each samples
+ex_hp_list <- lapply(X=ex_hp_list, FUN=function(x){
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x,selection.method='vst')
+})
+```
+
+```{r}
+all.features <- rownames(ex.human.common)
+
+# find anchor and integrate
+hp.anchors <- FindIntegrationAnchors(object.list = ex_hp_list,anchor.features = all.features)
+# create integrated data assay
+ex.hp.integrated <- IntegrateData(anchorset = hp.anchors,features.to.integrate = all.features)
+```
+```{r}
+rm(hp.anchors)
+rm(ex_hp_list)
+```
+
+```{r}
+ex.hp.integrated <- ex.hp.integrated %>% ScaleData(verbose = FALSE) %>%
+  RunPCA(npcs=30,verbose=FALSE)
+```
+
+```{r}
+ElbowPlot(ex.hp.integrated,ndims = 30)
+```
+
+```{r}
+ex.hp.integrated <- ex.hp.integrated %>% RunUMAP(reduction = 'pca',dims = 1:20) %>%
+  FindNeighbors(reduction = 'pca',dims = 1:20) %>%
+  FindClusters(resolution = 0.8)
+```
+
+```{r}
+# visulization
+ex_hp_batch <- DimPlot(ex.hp.integrated,reduction = 'umap',group.by = 'sample')+theme_classic(base_size = 20)
+ex_hp_batch
+ex.hp.cl <- DimPlot(ex.hp.integrated,reduction = 'umap',label = TRUE,group.by = 'seurat_clusters')
+ex.hp.cl
+```
+
+```{r}
+# DB file
+db_EX = '~/Desktop/EX_genes.xlsx';
+tissue = "Brain" 
+ex.hp.integrated <- CellTypeAnnotionInt(ex.hp.integrated, db_EX, tissue)
+```
+
+```{r}
+ex.hp.ct <- DimPlot(ex.hp.integrated,reduction = 'umap',label = TRUE,group.by = 'customclassif')
+ex.hp.ct
+```
+

@@ -1,0 +1,246 @@
+---
+title: "human_mouse_integrate"
+output: html_document
+date: "2023-05-16"
+---
+
+This script is to integrate human and mouse data
+
+```{r setup, include=FALSE}
+library(biomaRt)
+library(SingleCellExperiment)
+library(DropletUtils)
+library(ggplot2)
+library(scuttle)
+library(Seurat)
+```
+
+```{r}
+# load the dataset
+mouse.merge <- readRDS('~/Desktop/mouse_preprocessed.rds')
+human.integrated <- readRDS('~/Desktop/human_integrated.rds')
+```
+
+## Find gene orthologues
+
+```{r}
+# create mart object
+human <- useMart(biomart="ensembl", dataset = "hsapiens_gene_ensembl", verbose = TRUE, host = "dec2021.archive.ensembl.org")
+mouse <- useMart('ensembl',dataset = "mmusculus_gene_ensembl",verbose = TRUE,host = "dec2021.archive.ensembl.org")
+```
+
+```{r}
+# get mouse gene 
+mouse.gene <- rownames(ex.mouse)
+```
+
+
+```{r}
+# project mouse genes to human gene
+m2h.g <- getLDS(attributes = c("mgi_symbol"),filters = "mgi_symbol",
+                values = mouse.gene,mart = mouse,
+                attributesL = c('external_gene_name','mmusculus_homolog_orthology_confidence','mmusculus_homolog_goc_score','mmusculus_homolog_perc_id'),
+                martL = human,uniqueRows = T)
+# change colomn name
+colnames(m2h.g)[1] <- 'mouse.gene'
+colnames(m2h.g)[2] <- 'human.gene'
+```
+
+
+```{r}
+human.gene <- rownames(ex.human)
+human.gene.proj <- m2h.g$human.gene
+common.h.gene <- intersect(human.gene,human.gene.proj)
+```
+
+```{r}
+# Get the common genes
+common_genes <- m2h.g$human.gene[m2h.g$human.gene %in% common.h.gene]
+
+# Filter the first list based on the common genes
+m2h.g <- m2h.g[m2h.g$human.gene %in% common_genes,]
+# only keep one-to-one corespondence
+o2o.m2h.g <- m2h.g[!duplicated(m2h.g$mouse.gene),]
+o2o.m2h.g <- o2o.m2h.g[!duplicated(o2o.m2h.g$human.gene),]
+```
+15,539
+one-to-one: 14,851
+mean
+
+# get the average score for one-to-many and many-to-many genes
+```{r}
+m2h.test <- getLDS(attributes = c("mgi_symbol"),filters = "mgi_symbol",
+                values = mouse.gene,mart = mouse,
+                attributesL = c('external_gene_name','mmusculus_homolog_orthology_confidence','mmusculus_homolog_goc_score','mmusculus_homolog_perc_id'),
+                martL = human,uniqueRows = T)
+
+m2h.test <- m2h.test[m2h.test$Gene.name %in% common_genes,]
+
+o2m.m2h.g <- m2h.test[duplicated(m2h.test$Gene.name),]
+```
+
+# integrate only IN subset
+```{r}
+in.mouse.common <- GetAssayData(in.mouse)[intersect(o2o.m2h.g$mouse.gene,rownames(in.mouse)),]
+o2o.m2h.g <- o2o.m2h.g[-10819, ]
+in.human.common <- GetAssayData(in.human)[o2o.m2h.g$human.gene,]
+# change the gene's name as same as human
+rownames(in.mouse.common) <- rownames(in.human.common)
+```
+
+```{r}
+# convert dgCMatrix to seurat object
+in.human.common <- CreateSeuratObject(counts = in.human.common)
+in.mouse.common <- CreateSeuratObject(counts = in.mouse.common)
+```
+
+```{r}
+#change sample name
+#mouse
+in.mouse.common$sample <- in.mouse.common$orig.ident
+in.mouse.common$sample <- as.factor(in.mouse.common$sample)
+new.levels.m <- c("mouse", "mouse", 'mouse')
+levels(in.mouse.common$sample) <- new.levels.m
+# human
+in.human.common$sample <- in.human.common$orig.ident
+in.human.common$sample <- as.factor(in.human.common$sample)
+new_level_h <- c('human')
+levels(in.human.common$sample) <- new_level_h
+```
+
+
+# integrate
+```{r}
+# Put object in a list
+In_hm_list <- list()
+In_hm_list[['human']] <- in.human.common
+In_hm_list[['mouse']] <- in.mouse.common
+
+# Normalize and find variable genes in each samples
+In_hm_list <- lapply(X=In_hm_list, FUN=function(x){
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x,selection.method='vst', nfeatures =2000)
+})
+```
+
+```{r}
+all.features <- rownames(in.human.common)
+# find anchor and integrate
+hm.anchors <- FindIntegrationAnchors(object.list = In_hm_list,anchor.features = all.features)
+# create integrated data assay
+in.hm.integrated <- IntegrateData(anchorset = hm.anchors,features.to.integrate = all.features)
+```
+
+# scale and pca
+```{r}
+DefaultAssay(in.hm.integrated) <- 'integrated'
+# do scaling and dimensionality reduction 
+# using 30 dimensions
+in.hm.integrated <- ScaleData(in.hm.integrated,verbose = FALSE)
+in.hm.integrated <- RunPCA(in.hm.integrated,npcs=30,verbose=FALSE)
+```
+
+```{r}
+ElbowPlot(in.hm.integrated,ndim=30)
+```
+
+```{r}
+in.hm.integrated <- in.hm.integrated %>%
+  RunUMAP(reduction='pca',dims = 1:24)%>%
+  FindNeighbors(reduction = 'pca',dims = 1:24)%>%
+  FindClusters(resolution = 0.8)
+```
+
+
+```{r}
+in.hm.batch <- DimPlot(in.hm.integrated,reduction = 'umap',label = TRUE,repel = TRUE,group.by = "sample")
+in.hm.batch
+```
+```{r}
+in.hm.cl <- DimPlot(in.hm.integrated,reduction = 'umap',label = TRUE,repel = TRUE,group.by = "seurat_clusters")
+in.hm.cl
+```
+
+
+# integrate on EX
+```{r}
+# find ortholog genes
+ex.mouse.common <- GetAssayData(ex.mouse)[intersect(o2o.m2h.g2$mouse.gene,rownames(ex.mouse)),]
+o2o.m2h.g <- o2o.m2h.g[-10819, ]
+# Get the subset of cells based on the gene list
+ex.human.common <- GetAssayData(ex.human)[o2o.m2h.g$human.gene,]
+# change the gene's name as same as human
+rownames(ex.mouse.common) <- rownames(ex.human.common)
+```
+
+
+```{r}
+# convert dgCMatrix to seurat object
+ex.human.common <- CreateSeuratObject(counts = ex.human.common)
+ex.mouse.common <- CreateSeuratObject(counts = ex.mouse.common)
+```
+
+```{r}
+# change the sample name
+# human
+ex.human.common$sample <- ex.human.common$orig.ident
+ex.human.common$sample <- as.factor(ex.human.common$sample)
+new_levels <- c('human')
+levels(ex.human.common$sample) <- new_levels
+# mouse
+ex.mouse.common$sample <- ex.mouse.common$orig.ident
+ex.mouse.common$sample <- as.factor(ex.mouse.common$sample)
+new_levels <- c("mouse", "mouse", 'mouse')
+levels(ex.mouse.common$sample) <- new_levels
+```
+
+```{r}
+# Put object in a list
+ex_hm_list <- list()
+ex_hm_list[['human']] <- ex.human.common
+ex_hm_list[['mouse']] <- ex.mouse.common
+
+# Normalize and find variable genes in each samples
+ex_hm_list <- lapply(X=ex_hm_list, FUN=function(x){
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x,selection.method='vst', nfeatures =2000)
+})
+```
+
+```{r}
+all.features <- rownames(ex.human.common)
+
+# find anchor and integrate
+hm.anchors <- FindIntegrationAnchors(object.list = ex_hm_list,anchor.features = all.features)
+# create integrated data assay
+hm.ex.integrated <- IntegrateData(anchorset = hm.anchors,features.to.integrate = all.features)
+```
+
+# scale and dimension reduction
+```{r}
+DefaultAssay(hm.ex.integrated) <- 'integrated'
+# do scaling and dimensionality reduction 
+# using 30 dimensions
+hm.ex.integrated <- hm.ex.integrated %>% ScaleData(verbose = FALSE) %>%
+  RunPCA(npcs=30,verbose=FALSE)
+```
+
+# umap
+```{r}
+hm.ex.integrated <- hm.ex.integrated %>% RunUMAP(reduction = 'pca',dims = 1:27) %>%
+  FindNeighbors(reduction = 'pca',dims = 1:27) %>%
+  FindClusters(resolution = 1.0)
+```
+
+```{r}
+ex.hm.batch <- DimPlot(hm.ex.integrated,reduction = 'umap',repel = TRUE,group.by = "sample")
+ex.hm.batch
+```
+
+```{r}
+hm.ex.integrated <- CellTypeAnnotionInt(hm.ex.integrated,db_EX,tissue)
+```
+```{r}
+ex.hm.ct <- DimPlot(hm.ex.integrated,reduction = 'umap',label = TRUE,repel = TRUE,group.by = "customclassif")
+ex.hm.ct
+```

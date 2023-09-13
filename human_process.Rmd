@@ -1,0 +1,183 @@
+---
+title: "human_cellranger"
+output: html_document
+date: "2023-07-06"
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(scuttle)
+library(scater)
+library(scran)
+library(bluster) 
+library(Seurat)
+```
+
+```{r}
+# load gene set preparation function
+lapply(c("dplyr","Seurat","HGNChelper","openxlsx"), library, character.only = T)
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R")
+# load cell type annotation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+```
+
+## load the dataset
+```{r}
+load_seurat <- function(path,name) {
+  data <- Read10X(data.dir = path)
+  seurat <- CreateSeuratObject(counts = data, project = name, min.cells = 3, min.features = 200)
+  return(seurat)
+}
+```
+
+```{r}
+human76 <- load_seurat("~/Desktop/count_matrix_human/SRR16928876/filtered_feature_bc_matrix",'human76')
+human84 <- load_seurat("~/Desktop/count_matrix_human/SRR16928884/filtered_feature_bc_matrix",'human84')
+human86 <- load_seurat("~/Desktop/count_matrix_human/SRR16928886/filtered_feature_bc_matrix",'human86')
+```
+
+## Date integration
+```{r}
+library(patchwork)
+# Put object in a list
+Int_human_list <- list()
+Int_human_list[['HSB231_EC']] <- human76
+Int_human_list[['HSB237_EC']] <- human84
+Int_human_list[['HSB628_EC']] <- human86
+
+# Normalize and find variable genes in each samples
+Int_human_list <- lapply(X=Int_human_list, FUN=function(x){
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x,selection.method='vst', nfeatures =2000)
+})
+
+```
+
+```{r}
+# Perform integration
+features <- SelectIntegrationFeatures(object.list = Int_human_list)
+human.anchors <- FindIntegrationAnchors(object.list = Int_human_list)
+# create integrated data assay
+human.integrated <- IntegrateData(anchorset = human.anchors)
+```
+
+```{r}
+# release space
+rm(human.anchors)
+rm(Int_human_list)
+```
+
+
+## QC
+```{r}
+# Change the sample name to ncbi sample names
+human.integrated$orig.ident <- plyr::mapvalues(x=human.integrated$orig.ident,from = c("human76","human84","human86"),to = c('HSB231_EC','HSB237_EC','HSB628_EC'))
+```
+
+```{r}
+# add the percentage of mitochondrial genes
+human.integrated[["percent.mt"]] <- PercentageFeatureSet(human.integrated,pattern = '^MT-',assay = 'RNA')
+# visulization
+vp_human <- VlnPlot(human.integrated,features = c('nCount_RNA','nFeature_RNA','percent.mt'),ncol = 3,group.by = 'orig.ident') 
+#ggsave(plot = vp_human, filename = 'human_vlnplot.pdf')
+vp_human
+```
+
+```{r}
+# remove the percent.mt > 10 cells (paper)
+human.integrated[['QC']] <- ifelse(human.integrated@meta.data$percent.mt>10,'Fail','Pass')
+human.integrated <- subset(human.integrated,subset=QC=='Pass')
+```
+
+## Dimention reduction
+```{r}
+human.integrated <- ScaleData(human.integrated,verbose = FALSE)
+human.integrated <- RunPCA(human.integrated,npcs=30,verbose=FALSE)
+```
+
+```{r}
+# Elbow plot of PCs
+human.eb <- ElbowPlot(human.integrated,ndims = 30)
+#human.eb
+#ggsave(plot = eb, filename = 'human_elbowplot.pdf')
+```
+
+## Clustering
+```{r}
+human.integrated <- RunUMAP(human.integrated,reduction = 'pca', dims = 1:16)
+human.integrated <- FindNeighbors(human.integrated,reduction = 'pca',dims = 1:16)
+human.integrated <- FindClusters(human.integrated,resolution = 0.8)
+```
+
+## Cell type annotation
+```{r}
+# scType function 
+CellTypeAnnotionRNA <- function(dataset, database, tissue) {
+  gs_list = gene_sets_prepare(database, tissue)
+  # get cell-type by cell matrix
+  es.max = sctype_score(scRNAseqData = dataset[["RNA"]]@scale.data,
+                        scaled = TRUE, gs = gs_list$gs_positive, gs2 = NULL) 
+  # merge by cluster
+  cL_resutls = do.call("rbind",
+                       lapply(unique(dataset@meta.data$seurat_clusters),
+                              function(cl){
+                                es.max.cl =
+                      sort(rowSums(es.max[,rownames(dataset@meta.data[dataset@meta.data$seurat_clusters==cl, ])]), decreasing = !0)
+    head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(dataset@meta.data$seurat_clusters==cl)), 10)
+}))
+  sctype_scores = cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores) 
+  
+  # set low-confident (low ScType score) clusters to "unknown"
+  sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) <
+                       sctype_scores$ncells/4] = "Unknown"
+  print(sctype_scores[,1:3])
+  
+  dataset@meta.data$customclassif = ""
+  for(j in unique(sctype_scores$cluster)){
+  cl_type = sctype_scores[sctype_scores$cluster==j,]; 
+  dataset@meta.data$customclassif[dataset@meta.data$seurat_clusters == j] =
+    as.character(cl_type$type[1])
+  }
+  return(dataset)
+}
+```
+```{r}
+# DB file
+db_human = '~/Desktop/human_gene.xlsx';
+tissue = "Brain" 
+# Call function: celltypeannotation 
+human.integrated <- CellTypeAnnotionInt(human.integrated,db_human,tissue)
+```
+
+## visulization
+```{r}
+human.p16.cl <- DimPlot(human.integrated,reduction = 'umap', label = TRUE, repel = TRUE)
+human.p16.cl
+human.integrated$sample <- human.integrated$orig.ident
+human.batch <- DimPlot(human.integrated,reduction = 'umap',repel = TRUE,group.by = 'sample')
+#ggsave(plot = human_cl,width=13, height=9, filename = 'human_celltype.pdf')
+# Plot with cell type annotation 
+human.p16.ct <- DimPlot(human.integrated,reduction = 'umap',label = TRUE,repel = TRUE,group.by = 'customclassif') + theme_classic(base_size = 20)
+human.p16.ct
+#ggsave(human.p16.ct,width = 13,height = 9,filename = 'human(immature_added).pdf')
+```
+
+```{r}
+ct_overview <- human.integrated@meta.data %>% select(orig.ident , customclassif) %>% rename(dataset = orig.ident) %>% group_by(dataset , customclassif) %>%
+summarise(ncells = n()) %>%
+ggplot () +
+geom_bar(aes(customclassif , weight=ncells , fill=dataset)) + coord_flip() +theme_bw() + ylab('Number of cells') + xlab('Cell types') +theme_classic(base_size = 18)
+ct_overview
+```
+
+## Sub-clustering 
+```{r}
+Sub_set <- function(dataset, celltypename) {
+  celltype <- as_tibble(dataset@meta.data) %>% dplyr::select(seurat_clusters,customclassif) %>% unique() %>% arrange(seurat_clusters) %>% filter(customclassif %in% c(celltypename))
+  return(celltype)
+}
+h.sub.ex <- Sub_set(human.integrated,'Excitatory neurons') 
+ex.human <- subset(human.integrated, idents = h.sub.ex$seurat_clusters)
+h.sub.in <- Sub_set(human.integrated,'Inhibitory neurons/Interneurons') 
+in.human <- subset(human.integrated, idents = h.sub.in$seurat_clusters)
+```
